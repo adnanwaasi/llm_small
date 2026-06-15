@@ -1,0 +1,173 @@
+Tiny GPT architecture
+
+Overview
+- This project is a small decoder-only GPT trained on Instagram chat exports.
+- It has three main stages:
+  1. parse chat export JSON into normalized text
+  2. tokenize that text into ids
+  3. train and generate with a tiny GPT model
+
+Top-level structure
+- `src/tinygpt/`
+  - core library code
+- `scripts/`
+  - command-line entrypoints
+- `fuck/`
+  - raw Instagram export data
+- `data/processed/`
+  - generated corpus and JSONL artifacts
+- `artifacts/`
+  - model checkpoints and run metadata
+
+Core modules
+
+1. Data parsing layer
+- File: `src/tinygpt/instagram_parser.py`
+- Responsibility:
+  - discover Instagram thread JSON files
+  - normalize messages into structured records
+  - remove noise such as attachment/system spam
+  - optionally clean training text more aggressively
+  - build the plain-text corpus used for training
+
+Important behavior:
+- reads from:
+  - `your_instagram_activity/messages/inbox/*/message_*.json`
+  - `your_instagram_activity/messages/message_requests/*/message_*.json`
+- keeps real text
+- drops media-only and system-only junk from training text
+- can merge short fragmented chat lines into longer sentence-like spans
+
+2. Tokenization layer
+- File: `src/tinygpt/tokenizer.py`
+- Responsibility:
+  - convert text into token ids
+  - convert token ids back into text
+  - serialize tokenizer state into checkpoints
+
+Tokenizer modes:
+- `WordTokenizer`
+  - current default
+  - splits text into words, punctuation, and newline tokens
+  - intended to improve readability over character-level output
+- `CharacterTokenizer`
+  - legacy fallback
+  - one token per character
+
+Shared tokenizer API:
+- `encode()`
+- `encode_with_fallback()`
+- `decode()`
+- `to_dict()` / `from_dict()`
+
+3. Dataset layer
+- File: `src/tinygpt/dataset.py`
+- Responsibility:
+  - split token stream into train/validation segments
+  - sample contiguous windows for next-token prediction
+
+Input/output:
+- input: flat token id stream
+- output: `(inputs, targets)` tensors for language-model training
+
+4. Model layer
+- File: `src/tinygpt/model.py`
+- Responsibility:
+  - define the tiny decoder-only transformer
+
+Main components:
+- token embedding
+- positional embedding
+- causal self-attention
+- feed-forward blocks
+- transformer block stack
+- language-model head
+
+Generation behavior:
+- autoregressive next-token generation
+- supports:
+  - temperature
+  - top-k sampling
+  - repetition penalty
+  - greedy decoding
+
+5. Training layer
+- File: `src/tinygpt/trainer.py`
+- Responsibility:
+  - run the optimization loop
+  - estimate train/validation loss
+  - save checkpoints
+  - reload checkpoints for generation
+
+Checkpoint contents:
+- model weights
+- model config
+- training config
+- tokenizer state
+- step / val loss metadata
+
+Configuration
+- File: `src/tinygpt/config.py`
+- Dataclasses:
+  - `ParserConfig`
+  - `ModelConfig`
+  - `TrainingConfig`
+
+CLI entrypoints
+
+1. Prepare data
+- File: `scripts/prepare_data.py`
+- Flow:
+  - build `ParserConfig`
+  - optionally list speakers
+  - write JSONL + corpus text
+
+2. Train model
+- File: `scripts/train.py`
+- Flow:
+  - read corpus text
+  - build tokenizer
+  - create `ModelConfig`
+  - create `TrainingConfig`
+  - call `train_model()`
+
+3. Generate text
+- File: `scripts/generate.py`
+- Flow:
+  - load checkpoint
+  - restore model + tokenizer
+  - encode prompt
+  - generate continuation
+  - decode output text
+
+End-to-end data flow
+
+1. Raw export JSON
+- source: `fuck/`
+
+2. Normalized messages
+- output: `data/processed/*.jsonl`
+
+3. Training corpus
+- output: `data/processed/*.txt`
+
+4. Token stream
+- created in memory during training
+
+5. Model checkpoints
+- output: `artifacts/<run-name>/best.pt`
+
+6. Generated text
+- produced by `scripts/generate.py`
+
+Design choices
+- small, readable code over production complexity
+- from-scratch educational GPT rather than pretrained stack
+- pluggable tokenizer path with backward compatibility
+- parser cleanup is treated as a first-class quality lever
+
+Known architectural limits
+- still a tiny model, so quality depends heavily on corpus quality
+- current word tokenizer is simpler than a real subword tokenizer
+- checkpoint loading still relies on PyTorch serialization
+- multilingual robustness is limited compared with mature tokenizer libraries

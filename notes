@@ -1,0 +1,88 @@
+Tiny GPT notes
+
+Current state
+- Parser now removes attachment/system spam like `You sent an attachment.`
+- Media-only and link-only share messages are dropped from training text.
+- Share text is kept when it contains real text.
+- Word-level tokenization is now the default.
+- Corpus building now merges short fragmented chat lines into longer sentence-like spans.
+- Optional `--clean-training-text` mode drops mojibake-heavy and junky lines.
+
+Important reality
+- This is still a small from-scratch GPT.
+- Better output depends more on data quality than GPU.
+- If the corpus is noisy, the model will learn noisy text.
+- If the corpus is tiny, the model will repeat or collapse.
+
+Recommended workflow
+
+1. Build a cleaner corpus
+```bash
+PYTHONPATH=src .venv/bin/python scripts/prepare_data.py \
+  --input-dir "fuck" \
+  --clean-training-text \
+  --output-text "data/processed/all_cleaner.txt" \
+  --output-jsonl "data/processed/all_cleaner.jsonl"
+```
+
+2. Train with the word tokenizer
+```bash
+PYTHONPATH=src .venv/bin/python scripts/train.py \
+  --input-text "data/processed/all_cleaner.txt" \
+  --run-name "all-word-cleaner" \
+  --tokenizer-type word \
+  --context-length 32 \
+  --embedding-dim 64 \
+  --num-heads 4 \
+  --num-layers 2 \
+  --batch-size 8 \
+  --max-steps 800 \
+  --train-split 0.9 \
+  --eval-interval 50 \
+  --eval-batches 4 \
+  --learning-rate 1e-4 \
+  --device cuda
+```
+
+3. Generate text
+```bash
+PYTHONPATH=src .venv/bin/python scripts/generate.py \
+  --checkpoint "artifacts/all-word-cleaner/best.pt" \
+  --prompt "can i say something " \
+  --max-new-tokens 60 \
+  --temperature 0.8 \
+  --top-k 10 \
+  --repetition-penalty 1.25 \
+  --only-new-text \
+  --device cuda
+```
+
+What changed in code
+- `src/tinygpt/instagram_parser.py`
+  - safer file reading with replacement for bad bytes
+  - text sanitization for invisible/control junk
+  - better filtering of attachment/system noise
+  - sentence-like merging of short fragmented messages
+  - optional training-clean filtering
+
+- `src/tinygpt/tokenizer.py`
+  - default tokenizer is word-level
+  - character tokenizer still available
+  - checkpoint loading supports both tokenizer types
+
+- `scripts/train.py`
+  - supports `--tokenizer-type`
+
+- `scripts/generate.py`
+  - supports temperature/top-k/repetition penalty/greedy/only-new-text
+
+Known limitations
+- Some mojibake can still survive in the dataset.
+- Hindi/Indic text is not handled as well as a real subword tokenizer would handle it.
+- This project can improve further, but it will not behave like a large pretrained LLM.
+
+Likely next improvements
+- stronger English-clean mode
+- real subword tokenizer
+- better sentence-end stopping during generation
+- more training text from the same writing style
