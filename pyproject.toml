@@ -5,11 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tiny-instagram-gpt"
 version = "0.1.0"
-description = "A tiny GPT trained on Instagram chat exports"
+description = "A tiny GPT that learns to text like you"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.1.0",
+    "regex>=2023.0",
+    "pyarrow>=14.0",
 ]
 
 [tool.setuptools]
@@ -17,3 +19,7 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
