@@ -1,173 +1,83 @@
 Tiny GPT architecture
 
-Overview
-- This project is a small decoder-only GPT trained on Instagram chat exports.
-- It has three main stages:
-  1. parse chat export JSON into normalized text
-  2. tokenize that text into ids
-  3. train and generate with a tiny GPT model
+Goal
+- generate text the way one specific person writes (their texting voice)
+- from scratch: own tokenizer, own transformer, own training loop
 
-Top-level structure
-- `src/tinygpt/`
-  - core library code
-- `scripts/`
-  - command-line entrypoints
-- `fuck/`
-  - raw Instagram export data
-- `data/processed/`
-  - generated corpus and JSONL artifacts
-- `artifacts/`
-  - model checkpoints and run metadata
+Core problem and the design that answers it
+- personal chat data is tiny (often < 100k words) and a model can't learn a
+  language from that alone; the old version trained only on chats and produced noise
+- so knowledge and style are learned separately:
+  1. pretrain = general English chat from public dialogues (DailyDialog + SODA)
+  2. fine-tune = the person's style, from their conversations, loss only on their turns
+- this is the same recipe big chat models use (pretrain, then SFT), shrunk down
 
-Core modules
+Data layer
+- everything is normalized to one format: `Conversation(turns=[Turn(role, text)])`
+  with role in {"me", "them"}, stored as JSONL
+  - `src/tinygpt/conversation.py`: dataclasses, JSONL IO, `sessionize()`
+- `sessionize()` turns a chat thread into conversations:
+  - split when the silence exceeds 3 hours
+  - merge consecutive messages from the same person into one turn (joined with "\n"),
+    because people text a thought as several bubbles
+  - drop conversations where "me" never speaks
+- sources
+  - `instagram_parser.py`: Instagram JSON (also fixes Instagram's latin-1 mojibake, e.g. emoji)
+  - `sources.py`: WhatsApp txt (Android + iOS formats), Telegram JSON, DiscordChatExporter JSON,
+    plain text (paragraphs become `me` monologues), interview JSONL
+  - `public_data.py`: downloads Parquet from the Hugging Face mirror, detokenizes DailyDialog,
+    randomly assigns which speaker is "me" so the model learns both sides
+  - `scripts/interview.py`: cold-start data, where the user answers ~100 texts a friend might send
 
-1. Data parsing layer
-- File: `src/tinygpt/instagram_parser.py`
-- Responsibility:
-  - discover Instagram thread JSON files
-  - normalize messages into structured records
-  - remove noise such as attachment/system spam
-  - optionally clean training text more aggressively
-  - build the plain-text corpus used for training
+Tokenizer
+- `src/tinygpt/bpe.py`: byte-level BPE (GPT-2/4 style), 8192 vocab
+  - byte-level means no <unk>: emoji, Devanagari, Hinglish, and typos all encode
+  - GPT-4 regex pre-split, so merges never cross word boundaries
+  - trained with incremental pair counts + a lazy max-heap (seconds, pure Python)
+  - personal text upweighted 5x during training so the user's slang gets dedicated tokens
+- special tokens: <|bos|> <|them|> <|me|> <|end|>
+- the old word/char tokenizers remain in `tokenizer.py` for reference
 
-Important behavior:
-- reads from:
-  - `your_instagram_activity/messages/inbox/*/message_*.json`
-  - `your_instagram_activity/messages/message_requests/*/message_*.json`
-- keeps real text
-- drops media-only and system-only junk from training text
-- can merge short fragmented chat lines into longer sentence-like spans
+Chat format and loss mask (`chat_format.py`)
+    <|bos|><|them|>hey wyd<|end|><|me|>nothing much u?<|end|>...
+- pretrain: loss on every token
+- fine-tune: loss only on the text + <|end|> of `me` turns; `them` turns are context only
+- inference: history + "<|me|>" then sample until <|end|>
 
-2. Tokenization layer
-- File: `src/tinygpt/tokenizer.py`
-- Responsibility:
-  - convert text into token ids
-  - convert token ids back into text
-  - serialize tokenizer state into checkpoints
+Dataset (`dataset.py`)
+- `ChatStream`: all conversations concatenated into one token stream plus a bool mask
+- batches are sampled by picking a trainable position first, then placing a window around it,
+  so sparse "me" tokens still give every batch signal
+- train/val split by whole conversation (val = unseen chats, not unseen windows)
+- tokenized streams cached in `data/cache/` keyed by data mtime + tokenizer
 
-Tokenizer modes:
-- `WordTokenizer`
-  - current default
-  - splits text into words, punctuation, and newline tokens
-  - intended to improve readability over character-level output
-- `CharacterTokenizer`
-  - legacy fallback
-  - one token per character
+Model (`model.py`), Llama-style small decoder
+- token embedding (tied with the output head)
+- N x pre-norm block: RMSNorm -> causal MHA with RoPE (SDPA / flash kernels) -> residual
+                      RMSNorm -> SwiGLU MLP -> residual
+- final RMSNorm -> logits
+- default: 6 layers, 384 dim, 6 heads, 256 context, about 16M params (fits a 4 GB GPU with batch 32)
+- generation: temperature, top-k, top-p, sign-correct repetition penalty, stop tokens,
+  banned tokens (role tokens can't appear inside a reply)
 
-Shared tokenizer API:
-- `encode()`
-- `encode_with_fallback()`
-- `decode()`
-- `to_dict()` / `from_dict()`
+Training (`trainer.py`, `scripts/train.py`)
+- AdamW (betas 0.9/0.95, no decay on norm weights), warmup + cosine decay, grad clipping
+- mixed precision: bf16 where supported, otherwise fp16 + GradScaler (Turing GPUs like the T2000)
+- stage defaults
+  - pretrain: lr 6e-4, 10k steps (~2 h on a T2000, ~2 epochs of the public data), dropout 0
+  - finetune: lr 1e-4, dropout 0.1, eval every 50 steps, early stop after 6 evals without val improvement
+- checkpoints: best.pt / latest.pt contain weights, configs, tokenizer, step, val loss
 
-3. Dataset layer
-- File: `src/tinygpt/dataset.py`
-- Responsibility:
-  - split token stream into train/validation segments
-  - sample contiguous windows for next-token prediction
+CLI flow
+1. scripts/download_public_data.py -> data/public/dialogues.jsonl
+2. scripts/interview.py and/or scripts/prepare_data.py -> data/personal/conversations.jsonl
+3. scripts/train_tokenizer.py -> artifacts/tokenizer.json
+4. scripts/train.py --stage pretrain -> artifacts/base/best.pt
+5. scripts/train.py --stage finetune --init-from artifacts/base/best.pt -> artifacts/me/best.pt
+6. scripts/chat.py / scripts/generate.py
 
-Input/output:
-- input: flat token id stream
-- output: `(inputs, targets)` tensors for language-model training
-
-4. Model layer
-- File: `src/tinygpt/model.py`
-- Responsibility:
-  - define the tiny decoder-only transformer
-
-Main components:
-- token embedding
-- positional embedding
-- causal self-attention
-- feed-forward blocks
-- transformer block stack
-- language-model head
-
-Generation behavior:
-- autoregressive next-token generation
-- supports:
-  - temperature
-  - top-k sampling
-  - repetition penalty
-  - greedy decoding
-
-5. Training layer
-- File: `src/tinygpt/trainer.py`
-- Responsibility:
-  - run the optimization loop
-  - estimate train/validation loss
-  - save checkpoints
-  - reload checkpoints for generation
-
-Checkpoint contents:
-- model weights
-- model config
-- training config
-- tokenizer state
-- step / val loss metadata
-
-Configuration
-- File: `src/tinygpt/config.py`
-- Dataclasses:
-  - `ParserConfig`
-  - `ModelConfig`
-  - `TrainingConfig`
-
-CLI entrypoints
-
-1. Prepare data
-- File: `scripts/prepare_data.py`
-- Flow:
-  - build `ParserConfig`
-  - optionally list speakers
-  - write JSONL + corpus text
-
-2. Train model
-- File: `scripts/train.py`
-- Flow:
-  - read corpus text
-  - build tokenizer
-  - create `ModelConfig`
-  - create `TrainingConfig`
-  - call `train_model()`
-
-3. Generate text
-- File: `scripts/generate.py`
-- Flow:
-  - load checkpoint
-  - restore model + tokenizer
-  - encode prompt
-  - generate continuation
-  - decode output text
-
-End-to-end data flow
-
-1. Raw export JSON
-- source: `fuck/`
-
-2. Normalized messages
-- output: `data/processed/*.jsonl`
-
-3. Training corpus
-- output: `data/processed/*.txt`
-
-4. Token stream
-- created in memory during training
-
-5. Model checkpoints
-- output: `artifacts/<run-name>/best.pt`
-
-6. Generated text
-- produced by `scripts/generate.py`
-
-Design choices
-- small, readable code over production complexity
-- from-scratch educational GPT rather than pretrained stack
-- pluggable tokenizer path with backward compatibility
-- parser cleanup is treated as a first-class quality lever
-
-Known architectural limits
-- still a tiny model, so quality depends heavily on corpus quality
-- current word tokenizer is simpler than a real subword tokenizer
-- checkpoint loading still relies on PyTorch serialization
-- multilingual robustness is limited compared with mature tokenizer libraries
+Known limits
+- 16M params: the model writes like you, but its facts and reasoning are shallow
+- public data is English; Hinglish/Hindi style comes only from the fine-tune data
+- style strength scales with how much of your own text you provide (20k+ words recommended)
+- a fine-tuned checkpoint can memorize and repeat private messages
