@@ -1,14 +1,18 @@
 """Tokenizer implementations for the tiny GPT project.
 
-The repo started with a pure character-level tokenizer. To improve readability
-without adding heavy dependencies, the default tokenizer is now a small
-word-level tokenizer that splits text into words, punctuation, and newlines.
+The repo started with a pure character-level tokenizer, then a word-level one.
+Chat training now uses the byte-level BPE tokenizer in `tinygpt.bpe`; the older
+tokenizers are kept so existing checkpoints still load.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+from pathlib import Path
 import re
+
+from tinygpt.bpe import ByteBPETokenizer
 
 
 TOKEN_PATTERN = re.compile(r"\n|[^\W\d_][^\W_]*(?:['’-][^\W_]+)*|\d+|_|[^\w\s]", re.UNICODE)
@@ -187,10 +191,22 @@ def build_tokenizer(text: str, tokenizer_type: str) -> BaseTokenizer:
     raise ValueError(f"Unsupported tokenizer type: {tokenizer_type}")
 
 
-def load_tokenizer_from_dict(payload: dict[str, object]) -> BaseTokenizer:
+def save_tokenizer(tokenizer: BaseTokenizer | ByteBPETokenizer, path: str | Path) -> None:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(tokenizer.to_dict()), encoding="utf-8")
+
+
+def load_tokenizer(path: str | Path) -> BaseTokenizer | ByteBPETokenizer:
+    return load_tokenizer_from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+def load_tokenizer_from_dict(payload: dict[str, object]) -> BaseTokenizer | ByteBPETokenizer:
     """Load a tokenizer from checkpoint payload data."""
 
     tokenizer_type = str(payload.get("type", "character"))
+    if tokenizer_type == "bpe":
+        return ByteBPETokenizer.from_dict(payload)
     if tokenizer_type == "character":
         return CharacterTokenizer.from_dict(payload)
     if tokenizer_type == "word":
