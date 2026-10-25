@@ -21,6 +21,7 @@ from typing import Iterable
 import unicodedata
 
 from tinygpt.config import ParserConfig
+from tinygpt.conversation import Conversation, RawMessage, sessionize
 
 
 IGNORED_CONTENT_STRINGS = {
@@ -110,6 +111,46 @@ def iter_parsed_messages(config: ParserConfig) -> Iterable[ParsedMessage]:
     yield from parsed
 
 
+def iter_instagram_conversations(
+    input_dir: str | Path,
+    me_names: set[str],
+    *,
+    include_message_requests: bool = True,
+    gap_seconds: float | None = None,
+) -> Iterable[Conversation]:
+    """Yield `me`/`them` conversations, one thread at a time, split by silence gaps."""
+
+    root = Path(input_dir)
+    threads: dict[Path, list[RawMessage]] = {}
+    for file_path in discover_message_files(root, include_message_requests):
+        with file_path.open("r", encoding="utf-8", errors="replace") as handle:
+            thread = json.load(handle)
+
+        bucket = threads.setdefault(file_path.parent, [])
+        for raw_message in thread.get("messages", []):
+            normalized = _normalize_message(
+                raw_message=raw_message,
+                thread_path=str(file_path.parent.name),
+                thread_title="",
+                source_file=file_path,
+                lowercase=False,
+                include_reactions=False,
+            )
+            if normalized is None or not normalized.text:
+                continue
+            bucket.append(
+                RawMessage(
+                    sender=normalized.sender_name,
+                    timestamp=normalized.timestamp_ms / 1000,
+                    text=normalized.text,
+                )
+            )
+
+    for thread_dir, messages in threads.items():
+        kwargs = {} if gap_seconds is None else {"gap_seconds": gap_seconds}
+        yield from sessionize(messages, me_names, source="instagram", meta={"thread": thread_dir.name}, **kwargs)
+
+
 def collect_speaker_counts(config: ParserConfig) -> Counter[str]:
     """Count how many messages each speaker has in the export."""
 
@@ -123,7 +164,7 @@ def collect_speaker_counts(config: ParserConfig) -> Counter[str]:
         for raw_message in thread.get("messages", []):
             sender_name = raw_message.get("sender_name")
             if isinstance(sender_name, str) and sender_name.strip():
-                counts[sender_name] += 1
+                counts[fix_mojibake(sender_name)] += 1
 
     return counts
 
@@ -197,7 +238,7 @@ def _normalize_message(
     return ParsedMessage(
         thread_path=thread_path,
         thread_title=thread_title,
-        sender_name=sender_name,
+        sender_name=fix_mojibake(sender_name),
         timestamp_ms=timestamp_ms,
         timestamp_iso=timestamp_iso,
         text=text,
@@ -272,10 +313,22 @@ def _should_ignore_content(content: str) -> bool:
     return False
 
 
+def fix_mojibake(text: str) -> str:
+    """Undo Instagram's habit of exporting UTF-8 bytes as latin-1 characters.
+
+    e.g. `\u00f0\u009f\u0098\u0082` in the JSON is really the 😂 emoji.
+    """
+
+    try:
+        return text.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+
+
 def sanitize_text(text: str) -> str:
     """Normalize export text and strip invisible/control junk."""
 
-    normalized = unicodedata.normalize("NFC", text)
+    normalized = unicodedata.normalize("NFC", fix_mojibake(text))
     cleaned_characters: list[str] = []
     for character in normalized:
         if character in ZERO_WIDTH_CHARACTERS:
